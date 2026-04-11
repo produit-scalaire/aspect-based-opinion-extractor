@@ -38,8 +38,7 @@ During evaluation we use greedy decoding (`temperature=0.0`, `do_sample=False`) 
 
 ## 4. Results
 
-Macro-average accuracy on dev data: **[TODO: X.XX%]**
-
+Macro-average accuracy on dev data: 
 ## 5. Running the project
 
 The environment requires **torch** 2.9.1, **transformers** 5.5.0, **trl** 1.0.0, **peft** 0.18.1, and **accelerate** 1.13.0 as per the strict assignment guidelines.
