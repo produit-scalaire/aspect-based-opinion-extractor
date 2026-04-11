@@ -6,7 +6,7 @@ from typing import Literal
 class OpinionExtractor:
 
     # SET THE FOLLOWING CLASS VARIABLE to "FT" if you implemented a fine-tuning approach
-    method: Literal["NOFT", "FT"] = "NOFT"
+    method: Literal["NOFT", "FT"] = "FT"
 
     # DO NOT MODIFY THE SIGNATURE OF THIS METHOD, add code to implement it
     def __init__(self, cfg) -> None:
