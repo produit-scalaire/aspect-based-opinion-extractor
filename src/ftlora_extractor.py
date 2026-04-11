@@ -47,17 +47,24 @@ class OpinionExtractor:
         """
         Helper method to format the input as a strict instruction for Causal LM.
         """
-        prompt = (
-            "Analyze the restaurant review and extract the sentiment for: 'Price', 'Food', 'Service'.\n"
-            "Allowed values: 'Positive', 'Negative', 'Mixed', 'No Opinion'.\n"
-            "Output ONLY a valid JSON dictionary.\n\n"
-            f"Review: {review}\n\n"
-            "JSON Output:\n"
-        )
-        # If target is provided, we append it for training.
+        messages = [
+            {
+                "role": "system", 
+                "content": (
+                    "You are a strict JSON-only sentiment analysis AI. "
+                    "Extract the overall opinions for: 'Price', 'Food', 'Service'.\n"
+                    "Allowed values: 'Positive', 'Negative', 'Mixed', 'No Opinion'.\n"
+                    "Output ONLY a valid JSON dictionary, without markdown formatting or conversational text."
+                )
+            },
+            {"role": "user", "content": f"Review: {review}"}
+        ]
+        
         if target is not None:
-            prompt += json.dumps(target) + "\n"
-        return prompt
+            messages.append({"role": "assistant", "content": json.dumps(target)})
+            return self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+        else:
+            return self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
         
 
@@ -99,7 +106,7 @@ class OpinionExtractor:
         
         # Scale the learning rate dynamically based on the number of available devices.
         # We use a square-root scaling rule, standard for Adam/AdamW optimizers.
-        base_lr = 2e-4
+        base_lr = 5e-5 
         scaled_lr = base_lr * (num_devices ** 0.5)
 
         # 4. Set up the SFT Trainer
@@ -143,12 +150,12 @@ class OpinionExtractor:
         :return: a list of dicts, one per input review, containing the opinion values for the 3 aspects.
         """
         predictions = []
-        
-        # 1. Prepare prompts for the batch
         prompts = [self._format_prompt(text) for text in texts]
         
-        # 2. Tokenize inputs and move them to the device where the model is located
         device = next(self.model.parameters()).device
+        
+        self.tokenizer.padding_side = "left" 
+        
         inputs = self.tokenizer(
             prompts, 
             return_tensors="pt", 
@@ -157,44 +164,29 @@ class OpinionExtractor:
             max_length=512
         ).to(device)
 
-        # 3. Generate text (Inference)
-        # We use greedy decoding (temperature=0.0) because our classification task requires strict determinism
-        with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=64, # The expected JSON string is short
-                temperature=0.0,   
-                do_sample=False,
-                pad_token_id=self.tokenizer.eos_token_id
-            )
+        outputs = self.model.generate(
+            **inputs,
+            max_new_tokens=80, 
+            temperature=0.0,   
+            do_sample=False,
+            pad_token_id=self.tokenizer.pad_token_id,
+            eos_token_id=self.tokenizer.eos_token_id
+        )
 
-        # 4. Slice the output tensors to keep ONLY the newly generated tokens
         input_length = inputs.input_ids.shape[1]
         generated_tokens = outputs[:, input_length:]
         decoded_responses = self.tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
 
-        # 5. Robust Parsing Strategy (Zero-Trust)
         for response in decoded_responses:
-            # Baseline dictionary: If everything fails, assume "No Opinion"
             pred = {aspect: "No Opinion" for aspect in self.aspects}
             
-            # Use regex to isolate a JSON block, preventing crashes if the model generates surrounding chat text
             match = re.search(r'\{.*?\}', response, re.DOTALL)
             if match:
-                try:
-                    parsed_json = json.loads(match.group(0))
-                    # Map valid labels only
-                    for aspect in self.aspects:
-                        if aspect in parsed_json and parsed_json[aspect] in self.valid_labels:
-                            pred[aspect] = parsed_json[aspect]
-                except json.JSONDecodeError:
-                    # Fallback: if the JSON is malformed, use raw string matching as an ultimate fail-safe
-                    for aspect in self.aspects:
-                        pattern = rf'"{aspect}"\s*:\s*"({ "|".join(self.valid_labels) })"'
-                        fallback_match = re.search(pattern, response)
-                        if fallback_match:
-                            pred[aspect] = fallback_match.group(1)
-            
+                parsed_json = json.loads(match.group(0))
+                for aspect in self.aspects:
+                    if aspect in parsed_json and parsed_json[aspect] in self.valid_labels:
+                        pred[aspect] = parsed_json[aspect]
+        
             predictions.append(pred)
 
         return predictions
