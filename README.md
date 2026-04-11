@@ -38,7 +38,7 @@ During evaluation we use greedy decoding (`temperature=0.0`, `do_sample=False`) 
 
 ## 4. Results
 
-Macro-average accuracy on dev data: **[TODO: X.XX%]**
+Macro-average accuracy on dev data: 
 
 ## 5. Running the project
 
