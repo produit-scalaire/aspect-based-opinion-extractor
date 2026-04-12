@@ -33,8 +33,8 @@ class OpinionExtractor:
         self.accelerator = Accelerator()
         self.device = self.accelerator.device
 
-        self.model_id = "FacebookAI/xlm-roberta-base"
-        self.max_length = 256
+        self.model_id = "almanach/moderncamembert-base"
+        self.max_length = 320
         self.num_labels = len(LABELS)
 
         self.label2id = {label: i for i, label in enumerate(LABELS)}
