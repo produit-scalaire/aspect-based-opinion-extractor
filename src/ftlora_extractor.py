@@ -33,7 +33,7 @@ class OpinionExtractor:
         self.accelerator = Accelerator()
         self.device = self.accelerator.device
 
-        self.model_id = "almanach/moderncamembert-base"
+        self.model_id = "flaubert/flaubert_large_cased"
         self.max_length = 320
         self.num_labels = len(LABELS)
 
