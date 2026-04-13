@@ -325,6 +325,16 @@ class OpinionExtractor:
 
     def _normalize_label(self, value: str) -> str:
         value = str(value).strip()
+
+        # Remove noisy suffixes such as Positive#NE, Negative#foo, etc.
+        if "#" in value:
+            value = value.split("#", 1)[0].strip()
+
+        # Normalize spaces / underscores
+        value = value.replace("_", " ")
+        value = " ".join(value.split())
+
+        # Direct match
         if value in self.label_to_id:
             return value
 
@@ -334,11 +344,16 @@ class OpinionExtractor:
             "negative": "Negative",
             "mixed": "Mixed",
             "no opinion": "No Opinion",
-            "no_opinion": "No Opinion",
+            "noopinion": "No Opinion",
+            "no-opinion": "No Opinion",
             "none": "No Opinion",
+            "neutral": "No Opinion",
+            "no opinion ": "No Opinion",
         }
+
         if lower in mapping:
             return mapping[lower]
+
         raise ValueError(f"Unknown label: {value}")
 
     def _label_to_binary_targets(self, label: str) -> list[float]:
