@@ -1,16 +1,16 @@
 from __future__ import annotations
 
+import copy
 import math
+import os
 import random
-import re
-from collections import Counter
+from dataclasses import dataclass
 from typing import Literal
 
-import pandas as pd
+import numpy as np
 import torch
 import torch.nn as nn
 from accelerate import Accelerator
-from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 from transformers import (
     AutoModel,
@@ -19,476 +19,685 @@ from transformers import (
 )
 
 
-ASPECTS = ["Price", "Food", "Service"]
-LABELS = ["Negative", "Mixed", "No Opinion", "Positive"]
-
-
 class OpinionExtractor:
-
-    # Approach 3 = fine-tuned encoder-only LM
+    # Fine-tuning approach
     method: Literal["NOFT", "FT"] = "FT"
 
     def __init__(self, cfg) -> None:
         self.cfg = cfg
         self.accelerator = Accelerator()
-        self.device = self.accelerator.device
 
-        self.model_id = "flaubert/flaubert_large_cased"
-        self.max_length = 320
-        self.num_labels = len(LABELS)
+        self.aspects = ["Price", "Food", "Service"]
+        self.aspect_to_fr = {
+            "Price": "prix",
+            "Food": "nourriture",
+            "Service": "service",
+        }
 
-        self.label2id = {label: i for i, label in enumerate(LABELS)}
-        self.id2label = {i: label for label, i in self.label2id.items()}
+        self.label_to_id = {
+            "Positive": 0,
+            "Negative": 1,
+            "Mixed": 2,
+            "No Opinion": 3,
+        }
+        self.id_to_label = {v: k for k, v in self.label_to_id.items()}
 
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_id, use_fast=True)
+        # Authorized encoder-only models from the assignment.
+        # Best practical default for French reviews:
+        self.candidate_model_ids = [
+            "almanach/moderncamembert-base",
+            "FacebookAI/xlm-roberta-base",
+            "flaubert/flaubert_base_cased",
+            "flaubert/flaubert_base_uncased",
+            "flaubert/flaubert_small_cased",
+            "jhu-clsp/mmBERT-base",
+            "jhu-clsp/mmBERT-small",
+        ]
+
+        self.model_id = None
+        self.tokenizer = None
         self.model = None
 
-        self.seed = 1337
+        self.max_length = 256
+        self.num_labels_binary = 2  # [has_positive, has_negative]
 
-        # Simple calibrated decision rules for difficult classes
-        self.no_op_threshold = {
-            "Price": 0.45,
-            "Food": 0.40,
-            "Service": 0.40,
-        }
-        self.mixed_threshold = {
-            "Price": 0.22,
-            "Food": 0.20,
-            "Service": 0.20,
+        # Calibrated on validation after training
+        self.thresholds = {
+            aspect: {"pos": 0.5, "neg": 0.5} for aspect in self.aspects
         }
 
+        self._set_seed(42)
+
+    # -----------------------------
+    # Public API
+    # -----------------------------
     def train(self, train_data: list[dict], val_data: list[dict]) -> None:
         """
         Trains the model, if OpinionExtractor.method=="FT"
         """
-        self._set_seed(self.seed)
+        self._set_seed(42 + self.accelerator.process_index)
 
-        clean_train = self._prepare_dataframe(train_data, is_train=True)
-        clean_val = self._prepare_dataframe(val_data, is_train=False)
+        if torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
 
-        train_ds = ReviewDataset(clean_train)
-        val_ds = ReviewDataset(clean_val)
+        self.model_id = self._pick_model_id()
+        if self.accelerator.is_main_process:
+            print(f"Using encoder model: {self.model_id}")
 
-        num_devices = max(1, torch.cuda.device_count())
-        per_device_batch_size = 8 if torch.cuda.is_available() else 4
-        target_effective_batch = 32
-        grad_accum_steps = max(1, target_effective_batch // (per_device_batch_size * num_devices))
-        effective_batch = per_device_batch_size * num_devices * grad_accum_steps
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_id, use_fast=True)
+        self.model = AspectBinaryClassifier(self.model_id)
 
-        base_lr = 2.0e-5
-        lr = base_lr * (effective_batch / 32.0)
-        lr = min(3.0e-5, max(1.5e-5, lr))
+        train_samples = self._build_samples(train_data)
+        val_samples = self._build_samples(val_data)
+
+        train_dataset = AspectOpinionDataset(
+            train_samples,
+            tokenizer=self.tokenizer,
+            max_length=self.max_length,
+        )
+        val_dataset = AspectOpinionDataset(
+            val_samples,
+            tokenizer=self.tokenizer,
+            max_length=self.max_length,
+        )
+
+        # Reasonable default for a base encoder model
+        num_devices = max(1, self.accelerator.num_processes)
+        per_device_batch_size = 8
+        target_effective_batch_size = 48
+        grad_accum_steps = max(
+            1,
+            math.ceil(target_effective_batch_size / (per_device_batch_size * num_devices)),
+        )
+        effective_batch_size = per_device_batch_size * num_devices * grad_accum_steps
+
+        # Slight LR scaling with effective batch size
+        base_lr = 2e-5
+        learning_rate = base_lr * math.sqrt(effective_batch_size / target_effective_batch_size)
+        learning_rate = float(min(3e-5, max(1.5e-5, learning_rate)))
 
         train_loader = DataLoader(
-            train_ds,
+            train_dataset,
             batch_size=per_device_batch_size,
             shuffle=True,
-            collate_fn=self._collate_fn,
-            num_workers=0,
-            pin_memory=torch.cuda.is_available(),
+            collate_fn=train_dataset.collate_fn,
+            drop_last=False,
         )
         val_loader = DataLoader(
-            val_ds,
+            val_dataset,
             batch_size=per_device_batch_size * 2,
             shuffle=False,
-            collate_fn=self._collate_fn,
-            num_workers=0,
-            pin_memory=torch.cuda.is_available(),
+            collate_fn=val_dataset.collate_fn,
+            drop_last=False,
         )
 
-        class_weights = self._compute_class_weights(clean_train).to(self.device)
-
-        model = MultiHeadXLMR(
-            model_id=self.model_id,
-            num_labels=self.num_labels,
-            class_weights=class_weights,
+        optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=learning_rate,
+            weight_decay=0.01,
+            betas=(0.9, 0.999),
+            eps=1e-8,
         )
 
-        no_decay = ["bias", "LayerNorm.weight", "LayerNorm.bias"]
-        optimizer_grouped_parameters = [
-            {
-                "params": [
-                    p
-                    for n, p in model.named_parameters()
-                    if p.requires_grad and not any(nd in n for nd in no_decay)
-                ],
-                "weight_decay": 0.01,
-            },
-            {
-                "params": [
-                    p
-                    for n, p in model.named_parameters()
-                    if p.requires_grad and any(nd in n for nd in no_decay)
-                ],
-                "weight_decay": 0.0,
-            },
-        ]
-        optimizer = AdamW(optimizer_grouped_parameters, lr=lr, betas=(0.9, 0.999), eps=1e-8)
+        num_epochs = 6
+        steps_per_epoch = math.ceil(len(train_loader) / grad_accum_steps)
+        total_train_steps = max(1, num_epochs * steps_per_epoch)
+        warmup_steps = max(1, int(0.1 * total_train_steps))
 
-        num_epochs = 7
-        num_update_steps_per_epoch = math.ceil(len(train_loader) / grad_accum_steps)
-        max_train_steps = num_epochs * num_update_steps_per_epoch
-        warmup_steps = max(1, int(0.1 * max_train_steps))
         scheduler = get_linear_schedule_with_warmup(
             optimizer,
             num_warmup_steps=warmup_steps,
-            num_training_steps=max_train_steps,
+            num_training_steps=total_train_steps,
         )
 
-        model, optimizer, train_loader, val_loader, scheduler = self.accelerator.prepare(
-            model, optimizer, train_loader, val_loader, scheduler
+        (
+            self.model,
+            optimizer,
+            train_loader,
+            val_loader,
+            scheduler,
+        ) = self.accelerator.prepare(
+            self.model,
+            optimizer,
+            train_loader,
+            val_loader,
+            scheduler,
         )
 
-        best_metric = -1.0
         best_state = None
+        best_metric = -1.0
         patience = 2
-        bad_epochs = 0
+        patience_counter = 0
+
+        if self.accelerator.is_main_process:
+            print(
+                f"per_device_batch_size={per_device_batch_size}, "
+                f"grad_accum_steps={grad_accum_steps}, "
+                f"effective_batch_size={effective_batch_size}, "
+                f"lr={learning_rate:.2e}"
+            )
 
         for epoch in range(num_epochs):
-            model.train()
-            optimizer.zero_grad(set_to_none=True)
+            self.model.train()
+            optimizer.zero_grad()
 
-            for batch in train_loader:
-                with self.accelerator.accumulate(model):
-                    outputs = model(**batch)
-                    loss = outputs["loss"]
-                    self.accelerator.backward(loss)
+            running_loss = 0.0
+            num_batches = 0
+
+            for step, batch in enumerate(train_loader):
+                outputs = self.model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    labels=batch["labels"],
+                    pos_weight=batch["pos_weight"],
+                )
+                loss = outputs["loss"] / grad_accum_steps
+                self.accelerator.backward(loss)
+
+                if (step + 1) % grad_accum_steps == 0 or (step + 1) == len(train_loader):
+                    nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                     optimizer.step()
                     scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
+                    optimizer.zero_grad()
 
-            val_metric = self._evaluate(model, val_loader)
+                running_loss += float(loss.detach().item())
+                num_batches += 1
 
+            val_metric, raw_val_outputs = self._evaluate_binary_model(val_loader)
             if self.accelerator.is_main_process:
-                print(f"Epoch {epoch + 1}/{num_epochs} - val_macro_acc={val_metric:.4f}")
+                avg_train_loss = running_loss / max(1, num_batches)
+                print(
+                    f"Epoch {epoch + 1}/{num_epochs} | "
+                    f"train_loss={avg_train_loss:.4f} | "
+                    f"val_macro_acc={val_metric:.2f}"
+                )
 
-            if val_metric > best_metric:
+            improved = val_metric > best_metric
+            if improved:
                 best_metric = val_metric
-                bad_epochs = 0
-                unwrapped = self.accelerator.unwrap_model(model)
-                best_state = {
-                    k: v.detach().cpu().clone()
-                    for k, v in unwrapped.state_dict().items()
-                }
+                patience_counter = 0
+                unwrapped = self.accelerator.unwrap_model(self.model)
+                best_state = copy.deepcopy(unwrapped.state_dict())
             else:
-                bad_epochs += 1
-                if bad_epochs >= patience:
+                patience_counter += 1
+                if patience_counter >= patience:
                     if self.accelerator.is_main_process:
                         print("Early stopping triggered.")
                     break
 
-        self.accelerator.wait_for_everyone()
-        final_model = self.accelerator.unwrap_model(model)
+        # Restore best model
         if best_state is not None:
-            final_model.load_state_dict(best_state, strict=True)
-        final_model.eval()
+            self.accelerator.unwrap_model(self.model).load_state_dict(best_state)
 
-        self.model = final_model.to(self.device)
+        # Calibrate thresholds on validation set
+        self._calibrate_thresholds_from_val(val_loader)
+
+        self.model.eval()
+        self.accelerator.wait_for_everyone()
+
+        if self.accelerator.is_main_process:
+            print("Calibrated thresholds:")
+            for aspect in self.aspects:
+                print(aspect, self.thresholds[aspect])
 
     def predict(self, texts: list[str]) -> list[dict]:
         """
         :param texts: list of reviews from which to extract the opinion values
         :return: a list of dicts, one per input review, containing the opinion values for the 3 aspects.
         """
-        if self.model is None:
+        if self.model is None or self.tokenizer is None:
             raise RuntimeError("The model is not trained yet. Call train() first.")
 
-        clean_texts = [self._normalize_text(text) for text in texts]
-        encoded = self.tokenizer(
-            clean_texts,
-            padding=True,
-            truncation=True,
+        predict_samples = []
+        sample_map = []
+        for text_idx, text in enumerate(texts):
+            for aspect in self.aspects:
+                predict_samples.append(
+                    {
+                        "text": self._format_input(text, aspect),
+                        "aspect": aspect,
+                    }
+                )
+                sample_map.append((text_idx, aspect))
+
+        dataset = PredictDataset(
+            predict_samples,
+            tokenizer=self.tokenizer,
             max_length=self.max_length,
-            return_tensors="pt",
         )
-        encoded = {k: v.to(self.device) for k, v in encoded.items()}
+        loader = DataLoader(
+            dataset,
+            batch_size=max(8, int(getattr(self.cfg, "eval_batch_size", 10))),
+            shuffle=False,
+            collate_fn=dataset.collate_fn,
+        )
 
         self.model.eval()
-        with torch.no_grad():
-            outputs = self.model(**encoded)
-            preds = {
-                aspect: self._decode_with_rules(aspect, logits)
-                for aspect, logits in outputs["logits"].items()
-            }
-
-        results = []
-        for i in range(len(clean_texts)):
-            row = {}
-            for aspect in ASPECTS:
-                row[aspect] = self.id2label[preds[aspect][i]]
-            results.append(row)
-        return results
-
-    def _prepare_dataframe(self, data: list[dict], is_train: bool) -> pd.DataFrame:
-        rows = []
-        for row in data:
-            text = self._normalize_text(row["Review"])
-            if not text:
-                continue
-
-            item = {"Review": text}
-            for aspect in ASPECTS:
-                item[aspect] = self._normalize_label(row.get(aspect, "No Opinion"))
-            rows.append(item)
-
-        df = pd.DataFrame(rows)
-
-        if is_train:
-            # 1) remove exact duplicates with identical labels
-            df = df.drop_duplicates(subset=["Review", "Price", "Food", "Service"]).reset_index(drop=True)
-
-            # 2) aggregate duplicate reviews with noisy label disagreements by majority vote per aspect
-            grouped_rows = []
-            for review, group in df.groupby("Review", sort=False):
-                agg = {"Review": review}
-                for aspect in ASPECTS:
-                    votes = [self._normalize_label(x) for x in group[aspect].tolist()]
-                    agg[aspect] = Counter(votes).most_common(1)[0][0]
-                grouped_rows.append(agg)
-            df = pd.DataFrame(grouped_rows)
-
-            # 3) keep only non-empty normalized reviews
-            df = df[df["Review"].str.len() >= 3].reset_index(drop=True)
-
-            # 4) light oversampling for difficult labels
-            augmented_rows = []
-            for _, row in df.iterrows():
-                repeat = 1
-                labels = [row[a] for a in ASPECTS]
-
-                if "Mixed" in labels:
-                    repeat += 1
-
-                if sum(1 for x in labels if x == "No Opinion") >= 2:
-                    repeat += 1
-
-                for _ in range(repeat):
-                    augmented_rows.append(row.to_dict())
-
-            df = pd.DataFrame(augmented_rows).reset_index(drop=True)
-
-        return df
-
-    def _normalize_label(self, label: str) -> str:
-        if label is None:
-            return "No Opinion"
-        label = str(label).strip()
-        fixes = {
-            "Positive#NE": "Positive",
-            "Positif": "Positive",
-            "Négatif": "Negative",
-            "Sans Opinion": "No Opinion",
-            "No opinion": "No Opinion",
-            "Mixed/Neutral": "Mixed",
-        }
-        label = fixes.get(label, label)
-        if label not in self.label2id:
-            return "No Opinion"
-        return label
-
-    def _normalize_text(self, text: str) -> str:
-        text = "" if text is None else str(text)
-
-        # Strip CSV/TSV quote artifacts.
-        if len(text) >= 2 and text.startswith('"') and text.endswith('"'):
-            text = text[1:-1]
-        text = text.replace('""', '"')
-
-        # Basic Unicode/spacing cleanup.
-        text = text.replace("\u00a0", " ").replace("\u200b", " ")
-        text = text.replace("\r", " ").replace("\n", " ")
-        text = re.sub(r"\s+", " ", text)
-
-        # Compress very long punctuation streaks but keep sentiment cues.
-        text = re.sub(r"([!?.,;:])\1{2,}", r"\1\1", text)
-
-        # Compress pathological character repetition: "trooooop" -> "trooop"
-        text = re.sub(r"(.)\1{3,}", r"\1\1\1", text)
-
-        return text.strip()
-
-    def _compute_class_weights(self, df: pd.DataFrame) -> torch.Tensor:
-        weights = []
-        eps = 1e-6
-        for aspect in ASPECTS:
-            counts = torch.zeros(self.num_labels, dtype=torch.float)
-            for label in df[aspect].tolist():
-                counts[self.label2id[label]] += 1.0
-
-            inv = 1.0 / torch.sqrt(counts + eps)
-            inv = inv / inv.mean()
-
-            # Boost difficult classes
-            inv[self.label2id["Mixed"]] *= 1.35
-            inv[self.label2id["No Opinion"]] *= 1.15
-
-            inv = inv / inv.mean()
-            weights.append(inv)
-
-        return torch.stack(weights, dim=0)
-
-    def _collate_fn(self, batch: list[dict]) -> dict[str, torch.Tensor]:
-        texts = [item["Review"] for item in batch]
-        enc = self.tokenizer(
-            texts,
-            padding=True,
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt",
-        )
-        for aspect in ASPECTS:
-            enc[f"labels_{aspect.lower()}"] = torch.tensor(
-                [item[aspect] for item in batch],
-                dtype=torch.long,
-            )
-        return enc
-
-    def _evaluate(self, model: nn.Module, dataloader: DataLoader) -> float:
-        model.eval()
-
-        gathered_preds = {aspect: [] for aspect in ASPECTS}
-        gathered_refs = {aspect: [] for aspect in ASPECTS}
+        all_probs = []
 
         with torch.no_grad():
-            for batch in dataloader:
-                outputs = model(**batch)
-                for aspect in ASPECTS:
-                    logits = outputs["logits"][aspect]
-                    preds = torch.argmax(logits, dim=-1)
-                    refs = batch[f"labels_{aspect.lower()}"]
+            for batch in loader:
+                batch = {k: v.to(self.accelerator.device) for k, v in batch.items()}
+                outputs = self.model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    labels=None,
+                    pos_weight=None,
+                )
+                probs = torch.sigmoid(outputs["logits"]).detach().cpu().numpy()
+                all_probs.append(probs)
 
-                    preds, refs = self.accelerator.gather_for_metrics((preds, refs))
-                    gathered_preds[aspect].append(preds.cpu())
-                    gathered_refs[aspect].append(refs.cpu())
+        probs = np.concatenate(all_probs, axis=0) if all_probs else np.zeros((0, 2), dtype=np.float32)
 
-        macro = 0.0
-        for aspect in ASPECTS:
-            preds = torch.cat(gathered_preds[aspect], dim=0)
-            refs = torch.cat(gathered_refs[aspect], dim=0)
-            acc = (preds == refs).float().mean().item()
-            macro += acc
-        macro /= len(ASPECTS)
+        predictions = [{aspect: "No Opinion" for aspect in self.aspects} for _ in texts]
 
-        model.train()
-        return macro
+        for idx, (text_idx, aspect) in enumerate(sample_map):
+            pos_prob = float(probs[idx, 0])
+            neg_prob = float(probs[idx, 1])
 
-    def _decode_with_rules(self, aspect: str, logits: torch.Tensor) -> list[int]:
-        probs = torch.softmax(logits, dim=-1)
+            pos_thr = self.thresholds[aspect]["pos"]
+            neg_thr = self.thresholds[aspect]["neg"]
 
-        neg_id = self.label2id["Negative"]
-        mix_id = self.label2id["Mixed"]
-        no_id = self.label2id["No Opinion"]
-        pos_id = self.label2id["Positive"]
-
-        predictions = []
-        for p in probs:
-            p_neg = p[neg_id].item()
-            p_mix = p[mix_id].item()
-            p_no = p[no_id].item()
-            p_pos = p[pos_id].item()
-
-            # Prefer No Opinion when its posterior is high and polarity is weak
-            if p_no >= self.no_op_threshold[aspect] and max(p_neg, p_pos) < 0.40:
-                predictions.append(no_id)
-                continue
-
-            # Prefer Mixed when both positive and negative are sufficiently present
-            if min(p_neg, p_pos) >= self.mixed_threshold[aspect]:
-                predictions.append(mix_id)
-                continue
-
-            predictions.append(int(torch.argmax(p).item()))
+            label = self._binary_probs_to_label(pos_prob, neg_prob, pos_thr, neg_thr)
+            predictions[text_idx][aspect] = label
 
         return predictions
 
+    # -----------------------------
+    # Internal helpers
+    # -----------------------------
+    def _pick_model_id(self) -> str:
+        last_error = None
+        for model_id in self.candidate_model_ids:
+            try:
+                _ = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+                return model_id
+            except Exception as exc:
+                last_error = exc
+        raise RuntimeError(f"Could not load any authorized encoder model. Last error: {last_error}")
+
     def _set_seed(self, seed: int) -> None:
         random.seed(seed)
+        np.random.seed(seed)
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
+    def _normalize_label(self, value: str) -> str:
+        value = str(value).strip()
+        if value in self.label_to_id:
+            return value
 
-class ReviewDataset(Dataset):
-    def __init__(self, df: pd.DataFrame):
-        self.records = df.to_dict(orient="records")
-        self.label2id = {label: i for i, label in enumerate(LABELS)}
+        lower = value.lower()
+        mapping = {
+            "positive": "Positive",
+            "negative": "Negative",
+            "mixed": "Mixed",
+            "no opinion": "No Opinion",
+            "no_opinion": "No Opinion",
+            "none": "No Opinion",
+        }
+        if lower in mapping:
+            return mapping[lower]
+        raise ValueError(f"Unknown label: {value}")
 
-    def __len__(self) -> int:
-        return len(self.records)
+    def _label_to_binary_targets(self, label: str) -> list[float]:
+        label = self._normalize_label(label)
+        if label == "Positive":
+            return [1.0, 0.0]
+        if label == "Negative":
+            return [0.0, 1.0]
+        if label == "Mixed":
+            return [1.0, 1.0]
+        if label == "No Opinion":
+            return [0.0, 0.0]
+        raise ValueError(label)
 
-    def __getitem__(self, idx: int) -> dict:
-        row = self.records[idx]
-        item = {"Review": row["Review"]}
-        for aspect in ASPECTS:
-            item[aspect] = self.label2id[row[aspect]]
-        return item
+    def _format_input(self, review: str, aspect: str) -> str:
+        aspect_fr = self.aspect_to_fr[aspect]
+        # Short aspect-aware prompt; better than raw review-only input for ABSA.
+        return (
+            f"Aspect : {aspect_fr}. "
+            f"Détecter s'il y a un avis positif et/ou négatif. "
+            f"Avis : {str(review).strip()}"
+        )
+
+    def _build_samples(self, rows: list[dict]) -> list[dict]:
+        samples = []
+        for row in rows:
+            review = str(row["Review"])
+            for aspect in self.aspects:
+                label = self._normalize_label(row[aspect])
+                binary_targets = self._label_to_binary_targets(label)
+                samples.append(
+                    {
+                        "text": self._format_input(review, aspect),
+                        "aspect": aspect,
+                        "targets": binary_targets,
+                        "original_label": label,
+                    }
+                )
+        return samples
+
+    def _evaluate_binary_model(self, val_loader: DataLoader) -> tuple[float, dict]:
+        self.model.eval()
+
+        all_logits = []
+        all_labels = []
+        all_aspects = []
+
+        with torch.no_grad():
+            for batch in val_loader:
+                outputs = self.model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    labels=None,
+                    pos_weight=None,
+                )
+
+                logits = outputs["logits"]
+                labels = batch["labels"]
+
+                gathered_logits = self.accelerator.gather_for_metrics(logits)
+                gathered_labels = self.accelerator.gather_for_metrics(labels)
+
+                all_logits.append(gathered_logits.detach().cpu())
+                all_labels.append(gathered_labels.detach().cpu())
+
+                if "aspect_ids" in batch:
+                    gathered_aspect_ids = self.accelerator.gather_for_metrics(batch["aspect_ids"])
+                    all_aspects.append(gathered_aspect_ids.detach().cpu())
+
+        logits = torch.cat(all_logits, dim=0).numpy()
+        labels = torch.cat(all_labels, dim=0).numpy()
+        aspect_ids = torch.cat(all_aspects, dim=0).numpy()
+
+        probs = 1.0 / (1.0 + np.exp(-logits))
+
+        pred_labels = []
+        gold_labels = []
+
+        for i in range(len(probs)):
+            aspect = self.aspects[int(aspect_ids[i])]
+            pred = self._binary_probs_to_label(
+                float(probs[i, 0]),
+                float(probs[i, 1]),
+                self.thresholds[aspect]["pos"],
+                self.thresholds[aspect]["neg"],
+            )
+            gold = self._binary_targets_to_label(labels[i, 0], labels[i, 1])
+
+            pred_labels.append(pred)
+            gold_labels.append(gold)
+
+        per_aspect_correct = {aspect: [] for aspect in self.aspects}
+        for idx, pred, gold in zip(aspect_ids, pred_labels, gold_labels):
+            aspect = self.aspects[int(idx)]
+            per_aspect_correct[aspect].append(float(pred == gold))
+
+        macro_acc = 100.0 * np.mean(
+            [np.mean(v) if len(v) > 0 else 0.0 for v in per_aspect_correct.values()]
+        )
+
+        raw_outputs = {
+            "logits": logits,
+            "labels": labels,
+            "aspect_ids": aspect_ids,
+            "probs": probs,
+            "pred_labels": pred_labels,
+            "gold_labels": gold_labels,
+        }
+        return float(macro_acc), raw_outputs
+
+    def _binary_targets_to_label(self, pos: float, neg: float) -> str:
+        pos = int(round(float(pos)))
+        neg = int(round(float(neg)))
+        if pos == 1 and neg == 1:
+            return "Mixed"
+        if pos == 1 and neg == 0:
+            return "Positive"
+        if pos == 0 and neg == 1:
+            return "Negative"
+        return "No Opinion"
+
+    def _binary_probs_to_label(
+        self,
+        pos_prob: float,
+        neg_prob: float,
+        pos_thr: float,
+        neg_thr: float,
+    ) -> str:
+        has_pos = pos_prob >= pos_thr
+        has_neg = neg_prob >= neg_thr
+
+        if has_pos and has_neg:
+            return "Mixed"
+        if has_pos:
+            return "Positive"
+        if has_neg:
+            return "Negative"
+        return "No Opinion"
+
+    def _calibrate_thresholds_from_val(self, val_loader: DataLoader) -> None:
+        self.model.eval()
+
+        all_logits = []
+        all_labels = []
+        all_aspects = []
+
+        with torch.no_grad():
+            for batch in val_loader:
+                outputs = self.model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    labels=None,
+                    pos_weight=None,
+                )
+                logits = outputs["logits"]
+                labels = batch["labels"]
+
+                gathered_logits = self.accelerator.gather_for_metrics(logits)
+                gathered_labels = self.accelerator.gather_for_metrics(labels)
+                gathered_aspect_ids = self.accelerator.gather_for_metrics(batch["aspect_ids"])
+
+                all_logits.append(gathered_logits.detach().cpu())
+                all_labels.append(gathered_labels.detach().cpu())
+                all_aspects.append(gathered_aspect_ids.detach().cpu())
+
+        logits = torch.cat(all_logits, dim=0).numpy()
+        labels = torch.cat(all_labels, dim=0).numpy()
+        aspect_ids = torch.cat(all_aspects, dim=0).numpy()
+        probs = 1.0 / (1.0 + np.exp(-logits))
+
+        grid = [0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65]
+
+        for aspect_idx, aspect in enumerate(self.aspects):
+            mask = aspect_ids == aspect_idx
+            if np.sum(mask) == 0:
+                continue
+
+            aspect_probs = probs[mask]
+            aspect_labels = labels[mask]
+
+            best_acc = -1.0
+            best_pair = (0.5, 0.5)
+
+            for pos_thr in grid:
+                for neg_thr in grid:
+                    preds = []
+                    golds = []
+                    for i in range(len(aspect_probs)):
+                        pred = self._binary_probs_to_label(
+                            float(aspect_probs[i, 0]),
+                            float(aspect_probs[i, 1]),
+                            pos_thr,
+                            neg_thr,
+                        )
+                        gold = self._binary_targets_to_label(
+                            aspect_labels[i, 0],
+                            aspect_labels[i, 1],
+                        )
+                        preds.append(pred)
+                        golds.append(gold)
+                    acc = 100.0 * np.mean([float(p == g) for p, g in zip(preds, golds)])
+                    if acc > best_acc:
+                        best_acc = acc
+                        best_pair = (pos_thr, neg_thr)
+
+            self.thresholds[aspect]["pos"] = best_pair[0]
+            self.thresholds[aspect]["neg"] = best_pair[1]
 
 
-class MultiHeadXLMR(nn.Module):
-    def __init__(self, model_id: str, num_labels: int, class_weights: torch.Tensor):
+class AspectOpinionDataset(Dataset):
+    def __init__(self, samples, tokenizer, max_length: int = 256):
+        self.samples = samples
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.aspect_to_id = {"Price": 0, "Food": 1, "Service": 2}
+
+        # Precompute class imbalance weights for the two binary subtasks
+        labels = np.array([sample["targets"] for sample in samples], dtype=np.float32)
+        pos_counts = labels.sum(axis=0)
+        neg_counts = len(labels) - pos_counts
+        self.pos_weight = (neg_counts + 1.0) / (pos_counts + 1.0)
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        item = self.samples[idx]
+        enc = self.tokenizer(
+            item["text"],
+            truncation=True,
+            max_length=self.max_length,
+            padding=False,
+            return_tensors=None,
+        )
+        return {
+            "input_ids": enc["input_ids"],
+            "attention_mask": enc["attention_mask"],
+            "labels": item["targets"],
+            "aspect_id": self.aspect_to_id[item["aspect"]],
+        }
+
+    def collate_fn(self, batch):
+        input_ids = [torch.tensor(x["input_ids"], dtype=torch.long) for x in batch]
+        attention_mask = [torch.tensor(x["attention_mask"], dtype=torch.long) for x in batch]
+        labels = torch.tensor([x["labels"] for x in batch], dtype=torch.float32)
+        aspect_ids = torch.tensor([x["aspect_id"] for x in batch], dtype=torch.long)
+
+        padded = self.tokenizer.pad(
+            {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+            },
+            padding=True,
+            return_tensors="pt",
+        )
+
+        pos_weight = torch.tensor(self.pos_weight, dtype=torch.float32)
+
+        return {
+            "input_ids": padded["input_ids"],
+            "attention_mask": padded["attention_mask"],
+            "labels": labels,
+            "aspect_ids": aspect_ids,
+            "pos_weight": pos_weight,
+        }
+
+
+class PredictDataset(Dataset):
+    def __init__(self, samples, tokenizer, max_length: int = 256):
+        self.samples = samples
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        item = self.samples[idx]
+        enc = self.tokenizer(
+            item["text"],
+            truncation=True,
+            max_length=self.max_length,
+            padding=False,
+            return_tensors=None,
+        )
+        return {
+            "input_ids": enc["input_ids"],
+            "attention_mask": enc["attention_mask"],
+        }
+
+    def collate_fn(self, batch):
+        input_ids = [torch.tensor(x["input_ids"], dtype=torch.long) for x in batch]
+        attention_mask = [torch.tensor(x["attention_mask"], dtype=torch.long) for x in batch]
+
+        padded = self.tokenizer.pad(
+            {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+            },
+            padding=True,
+            return_tensors="pt",
+        )
+        return {
+            "input_ids": padded["input_ids"],
+            "attention_mask": padded["attention_mask"],
+        }
+
+
+class AspectBinaryClassifier(nn.Module):
+    def __init__(self, model_id: str):
         super().__init__()
         self.encoder = AutoModel.from_pretrained(model_id)
+
         hidden_size = self.encoder.config.hidden_size
 
+        # A bit more robust than raw CLS alone for RoBERTa/CamemBERT-like encoders:
         self.dropout = nn.Dropout(0.2)
-        self.norm = nn.LayerNorm(hidden_size * 2)
-
-        self.price_head = AspectHead(hidden_size * 2, num_labels)
-        self.food_head = AspectHead(hidden_size * 2, num_labels)
-        self.service_head = AspectHead(hidden_size * 2, num_labels)
-
-        self.register_buffer("class_weights", class_weights)
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_size, 2),
+        )
 
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        labels_price: torch.Tensor | None = None,
-        labels_food: torch.Tensor | None = None,
-        labels_service: torch.Tensor | None = None,
-        **kwargs
-    ) -> dict:
-        outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
-        hidden = outputs.last_hidden_state
-
-        cls = hidden[:, 0]
-        mask = attention_mask.unsqueeze(-1).to(hidden.dtype)
-        mean = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
-
-        pooled = torch.cat([cls, mean], dim=-1)
-        pooled = self.norm(self.dropout(pooled))
-
-        logits = {
-            "Price": self.price_head(pooled),
-            "Food": self.food_head(pooled),
-            "Service": self.service_head(pooled),
-        }
-
-        result = {"logits": logits}
-
-        if labels_price is not None and labels_food is not None and labels_service is not None:
-            losses = []
-            ce_price = nn.CrossEntropyLoss(weight=self.class_weights[0], label_smoothing=0.03)
-            ce_food = nn.CrossEntropyLoss(weight=self.class_weights[1], label_smoothing=0.03)
-            ce_service = nn.CrossEntropyLoss(weight=self.class_weights[2], label_smoothing=0.03)
-
-            losses.append(ce_price(logits["Price"], labels_price))
-            losses.append(ce_food(logits["Food"], labels_food))
-            losses.append(ce_service(logits["Service"], labels_service))
-
-            result["loss"] = sum(losses) / len(losses)
-
-        return result
-
-
-class AspectHead(nn.Module):
-    def __init__(self, input_dim: int, num_labels: int):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(input_dim, input_dim // 2),
-            nn.GELU(),
-            nn.Dropout(0.15),
-            nn.Linear(input_dim // 2, num_labels),
+        labels: torch.Tensor | None = None,
+        pos_weight: torch.Tensor | None = None,
+    ):
+        outputs = self.encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            return_dict=True,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.mlp(x)
+        last_hidden = outputs.last_hidden_state  # [B, T, H]
+        cls_vec = last_hidden[:, 0, :]  # [B, H]
+
+        # Masked mean pooling
+        mask = attention_mask.unsqueeze(-1).float()  # [B, T, 1]
+        masked_hidden = last_hidden * mask
+        sum_hidden = masked_hidden.sum(dim=1)
+        denom = mask.sum(dim=1).clamp(min=1e-6)
+        mean_vec = sum_hidden / denom
+
+        pooled = torch.cat([cls_vec, mean_vec], dim=-1)
+        logits = self.classifier(self.dropout(pooled))
+
+        loss = None
+        if labels is not None:
+            if pos_weight is not None:
+                # Broadcast from shape [2] to device
+                pos_weight = pos_weight.to(logits.device)
+            loss_fct = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+            loss = loss_fct(logits, labels.to(logits.device))
+
+        return {
+            "loss": loss,
+            "logits": logits,
+        }
