@@ -73,9 +73,6 @@ class OpinionExtractor:
         inputs = [{"review": text, "format_instructions": format_instructions} for text in texts]
         
         try:
-            # Use LangChain's built-in batch processing.
-            # max_concurrency=2 prevents overloading the RTX 5090 VRAM and Ollama's queue,
-            # completely avoiding the CPU Offloading and the asyncio/accelerate deadlocks.
             parsed_outputs = self.chain.batch(inputs, config={"max_concurrency": 2})
             
             # Map outputs securely to avoid any hallucinated keys
